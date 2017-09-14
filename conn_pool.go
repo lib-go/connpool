@@ -1,7 +1,6 @@
 package connpool
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -23,58 +22,48 @@ type conn struct {
 	TimeSpent time.Duration
 }
 
-type ConnPool struct {
+type ConnFactory func() (net.Conn, error)
+
+type AutoConnPool struct {
 	sync.Mutex
 
-	addr      string
-	ssl       bool
-	conns     chan *conn
-	maxIdle   time.Duration
+	maxTTL  time.Duration
+	factory ConnFactory
+
+	conns chan *conn
+
 	queueSize uint // 猜测的最佳的待命连接数
 }
 
-func New(addr string, ssl bool, maxIdle time.Duration) *ConnPool {
-	pool := &ConnPool{
-		addr:      addr,
-		ssl:       ssl,
-		maxIdle:   maxIdle,
+func New(maxTTL time.Duration, factory ConnFactory) *AutoConnPool {
+	pool := &AutoConnPool{
+		maxTTL:    maxTTL,
 		queueSize: 1,
+		factory:   factory,
 	}
 
 	return pool
 }
 
-func (p *ConnPool) SetMaxIdle(d time.Duration) {
-	p.maxIdle = d
+func (p *AutoConnPool) SetMaxIdle(d time.Duration) {
+	p.maxTTL = d
 }
 
-func (p *ConnPool) Size() int {
+func (p *AutoConnPool) Size() int {
 	return len(p.conns)
 }
 
-func (p *ConnPool) TargetSize() int {
+func (p *AutoConnPool) TargetSize() int {
 	return int(p.queueSize)
 }
 
-func (p *ConnPool) String() string {
-	return fmt.Sprintf("[pool %s %v/%v]", p.addr, p.Size(), p.TargetSize())
+func (p *AutoConnPool) String() string {
+	return fmt.Sprintf("[pool %v/%v]", p.Size(), p.TargetSize())
 }
 
-func (p *ConnPool) makeConn() {
-	var c net.Conn
-	var e error
-
+func (p *AutoConnPool) makeConn() {
 	t := time.Now()
-	e = Do(func(attempt int) (retry bool, err error) {
-		c, err = net.DialTimeout("tcp4", p.addr, time.Second*time.Duration(attempt))
-		return attempt < 3, err
-	})
-	if e == nil && c != nil && p.ssl {
-		var host string
-		if host, _, e = net.SplitHostPort(p.addr); e == nil {
-			c, e = sslHandshake(c, host)
-		}
-	}
+	c, e := p.factory()
 
 	timeSpent := time.Now().Sub(t)
 	p.conns <- &conn{
@@ -87,7 +76,7 @@ func (p *ConnPool) makeConn() {
 	Logger.Printf("%v . %v (%v)", p, timeSpent, e)
 }
 
-func (p *ConnPool) Get() (net.Conn, error) {
+func (p *AutoConnPool) Get() (net.Conn, error) {
 	p.Lock()
 	defer p.Unlock()
 
@@ -113,7 +102,7 @@ func (p *ConnPool) Get() (net.Conn, error) {
 		pc = <-p.conns
 
 		// 如果获得的conn生成时间过早,则减少备用连接数
-		if time.Now().Sub(pc.createdAt) > p.maxIdle {
+		if time.Now().Sub(pc.createdAt) > p.maxTTL {
 			p.queueSize -= 1
 			if pc.c != nil {
 				pc.c.Close()
@@ -125,19 +114,5 @@ func (p *ConnPool) Get() (net.Conn, error) {
 
 		Logger.Printf("%s >", p)
 		return pc.c, pc.Err
-	}
-}
-
-func sslHandshake(conn net.Conn, host string) (net.Conn, error) {
-	secureConn := tls.Client(conn, &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: true,
-	})
-	err := secureConn.Handshake()
-	if err != nil {
-		conn.Close()
-		return nil, err
-	} else {
-		return secureConn, nil
 	}
 }

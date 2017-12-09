@@ -5,7 +5,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,21 +25,20 @@ type conn struct {
 type ConnFactory func() (net.Conn, error)
 
 type AutoConnPool struct {
-	sync.Mutex
-
 	maxTTL  time.Duration
 	factory ConnFactory
 
-	conns chan *conn
+	ch chan *conn
 
-	queueSize uint // 猜测的最佳的待命连接数
+	queueSize int32 // 猜测的最佳的待命连接数
 }
 
 func New(maxTTL time.Duration, factory ConnFactory) *AutoConnPool {
 	pool := &AutoConnPool{
 		maxTTL:    maxTTL,
-		queueSize: 1,
+		queueSize: 0,
 		factory:   factory,
+		ch:        make(chan *conn, 1024),
 	}
 
 	return pool
@@ -50,7 +49,7 @@ func (p *AutoConnPool) SetMaxIdle(d time.Duration) {
 }
 
 func (p *AutoConnPool) Size() int {
-	return len(p.conns)
+	return len(p.ch)
 }
 
 func (p *AutoConnPool) TargetSize() int {
@@ -61,58 +60,66 @@ func (p *AutoConnPool) String() string {
 	return fmt.Sprintf("[pool %v/%v]", p.Size(), p.TargetSize())
 }
 
+func (p *AutoConnPool) safeFactory() (c net.Conn, e error) {
+	defer func() {
+		if r := recover(); r != nil {
+			e = fmt.Errorf("panic: %s", r)
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
+
+	c, e = p.factory()
+	return
+}
+
 func (p *AutoConnPool) makeConn() {
 	t := time.Now()
-	c, e := p.factory()
+	c, e := p.safeFactory()
 
 	timeSpent := time.Now().Sub(t)
-	p.conns <- &conn{
+	p.ch <- &conn{
 		c:         c,
 		Err:       e,
 		createdAt: t,
 		TimeSpent: timeSpent,
 	}
 
-	Logger.Printf("%v . %v (%v)", p, timeSpent, e)
+	if e == nil {
+		Logger.Printf("%v . %v", p, timeSpent)
+	} else {
+		Logger.Printf("%v . %v (%v)", p, timeSpent, e)
+	}
 }
 
 func (p *AutoConnPool) Get() (net.Conn, error) {
-	p.Lock()
-	defer p.Unlock()
-
-	var i uint
-
-	// 初次Get时,自动初始化连接池
-	if p.conns == nil {
-		p.conns = make(chan *conn, 1024)
-		for i = 0; i < p.queueSize; i++ {
-			go p.makeConn()
-		}
-	}
-
-	var pc *conn
+	var x *conn
 	for {
-		// 连接不够用时,增大备用连接数
-		if len(p.conns) == 0 {
-			p.queueSize += 1
+		select {
+		case x = <-p.ch:
+			// 连接过老，说明queueSize过大，要丢弃连接并且缩小queueSize
+			if time.Now().Sub(x.createdAt) > p.maxTTL {
+				atomic.AddInt32(&p.queueSize, -1)
+				if x.c != nil {
+					x.c.Close()
+				}
+				continue
+			} else {
+				go p.makeConn()
+			}
+
+		default:
+			// 连接池中没有连接，说明queueSize不够大，需要size+1
+			atomic.AddInt32(&p.queueSize, 1)
 			Logger.Printf("%s +", p)
 			go p.makeConn()
-		}
 
-		pc = <-p.conns
-
-		// 如果获得的conn生成时间过早,则减少备用连接数
-		if time.Now().Sub(pc.createdAt) > p.maxTTL {
-			p.queueSize -= 1
-			if pc.c != nil {
-				pc.c.Close()
-			}
-			continue // 重新获取一个连接
-		} else {
+			x = <-p.ch
 			go p.makeConn()
 		}
 
 		Logger.Printf("%s >", p)
-		return pc.c, pc.Err
+		return x.c, x.Err
 	}
 }
